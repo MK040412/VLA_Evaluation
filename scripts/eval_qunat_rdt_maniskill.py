@@ -9,7 +9,6 @@ import random
 from collections import deque
 
 import gymnasium as gym
-from gymnasium.wrappers.time_limit import TimeLimit
 import numpy as np
 import torch
 from PIL import Image
@@ -19,6 +18,7 @@ import cv2  # live view
 
 from mani_skill.envs.sapien_env import BaseEnv  # noqa: F401
 from mani_skill.utils import common, gym_utils   # noqa: F401
+from gymnasium.wrappers.time_limit import TimeLimit
 
 from scripts.maniskill_model import create_model
 
@@ -26,7 +26,6 @@ from scripts.maniskill_model import create_model
 # Helpers to robustly read RGBs
 # -----------------------------
 def _to_numpy_rgb(x: Any) -> Optional[np.ndarray]:
-    """Convert torch.Tensor/np.ndarray to (H, W, 3) numpy RGB if possible."""
     if torch.is_tensor(x):
         arr = x.detach().cpu()
         if arr.ndim == 4 and arr.shape[0] == 1:
@@ -45,7 +44,7 @@ def _to_numpy_rgb(x: Any) -> Optional[np.ndarray]:
         if arr.ndim == 4 and arr.shape[0] == 1:
             arr = np.squeeze(arr, axis=0)
         if arr.ndim == 3 and arr.shape[-1] in (1, 3, 4):
-            if arr.shape[-1] == 4:
+            if arr.ndim == 3 and arr.shape[-1] == 4:
                 arr = arr[..., :3]
             return arr
         if arr.ndim == 2:
@@ -55,7 +54,6 @@ def _to_numpy_rgb(x: Any) -> Optional[np.ndarray]:
 
 
 def _find_first_frame(x: Any) -> Optional[np.ndarray]:
-    """Find first RGB frame in nested dict/list/tuple/tensor/ndarray."""
     arr = _to_numpy_rgb(x)
     if arr is not None:
         return arr
@@ -73,7 +71,6 @@ def _find_first_frame(x: Any) -> Optional[np.ndarray]:
 
 
 def _extract_rgb(frame: Any, obs: Optional[dict] = None) -> np.ndarray:
-    """Try to extract (H, W, 3) numpy RGB from env.render() or obs."""
     arr = _find_first_frame(frame)
     if arr is not None:
         return arr
@@ -125,9 +122,11 @@ def parse_args(args=None):
     parser.add_argument("--action-downsample", type=int, default=4,
                         help="RDT 64-step 예측에서 몇 스텝마다 실행할지(기본 4 → 16회 실행). 1로 낮추면 더 오래 실행.")
 
-    # (선택) 양자화 아블레이션 옵션
+    # (선택) 양자화 아블레이션 옵션(오프라인 가중치 저장 방식과는 독립)
     parser.add_argument("--quant", type=str, default="none",
                         choices=["none", "8bit", "4bit"], help="weight-only 양자화 모드")
+    parser.add_argument("--quant-modules", type=str, nargs="*", default=None,
+                        help="양자화할 모듈 이름의 정규식 패턴 목록. 지정하지 않으면 --quant-scope 사용")
     parser.add_argument("--quant-scope", type=str, default="all",
                         choices=["all", "attn", "ffn"], help="양자화 대상 범위")
     parser.add_argument("--quant-compute-dtype", type=str, default=None,
@@ -136,8 +135,12 @@ def parse_args(args=None):
     parser.add_argument("--quant-include-vision", action="store_true",
                         help="SigLIP 비전 인코더도 양자화")
 
-    parser.add_argument("--quant-modules", type=str, nargs='*', default=None,
-                        help="양자화할 특정 모듈 이름 리스트 (공백으로 구분)")
+    # ▶ 영상 저장 옵션
+    parser.add_argument("--save-video-dir", type=str, default=None,
+                        help="지정하면 에피소드별 mp4를 저장")
+    parser.add_argument("--video-fps", type=int, default=20, help="저장 영상 FPS")
+    parser.add_argument("--video-fourcc", type=str, default="mp4v",
+                        help="cv2.VideoWriter_fourcc code. 예: mp4v, avc1, H264")
 
     return parser.parse_args(args)
 
@@ -165,7 +168,6 @@ def load_lang_embed(env_id: str, explicit_path: Optional[str]):
         if p and os.path.exists(p):
             print(f"[INFO] Using precomputed language embedding: {p}")
             emb = torch.load(p, map_location="cpu")
-            # (L, D) → (1, L, D) 형태 보정
             if isinstance(emb, torch.Tensor) and emb.ndim == 2:
                 emb = emb.unsqueeze(0)
             return emb
@@ -176,7 +178,6 @@ def load_lang_embed(env_id: str, explicit_path: Optional[str]):
 
 
 def _force_time_limit(env: gym.Env, max_steps: int) -> gym.Env:
-    """ManiSkill 기본 50 스텝 TimeLimit을 원하는 값으로 강제 교체."""
     cur = env
     while isinstance(cur, TimeLimit):
         cur = cur.env
@@ -186,10 +187,9 @@ def _force_time_limit(env: gym.Env, max_steps: int) -> gym.Env:
 def main():
     args = parse_args()
 
-    # 사람이 보기 위해 human을 주더라도 모델 입력을 위해 rgb_array가 필요
     if args.render_mode != "rgb_array":
         print("[WARN] 'human' viewer는 ndarray 프레임을 돌려주지 않습니다. "
-              "모델 입력/라이브뷰를 위해 'rgb_array'로 전환합니다.")
+              "모델 입력/라이브뷰/영상저장을 위해 'rgb_array'로 전환합니다.")
         args.render_mode = "rgb_array"
 
     set_seeds(args.random_seed)
@@ -236,11 +236,11 @@ def main():
         pretrained=args.pretrained_path,
         pretrained_text_encoder_name_or_path=args.pretrained_text_encoder_name_or_path,
         pretrained_vision_encoder_name_or_path=args.pretrained_vision_encoder_name_or_path,
-        quant_mode=args.quant,                         # "none" | "8bit" | "4bit"
-        quant_scope=args.quant_scope,                  # "all" | "attn" | "ffn"
-        quant_compute_dtype=args.quant_compute_dtype,  # None | "fp16" | "bf16" | "fp32"
-        quant_include_vision=args.quant_include_vision, # True/False
-        quant_modules=args.quant_modules
+        quant_mode=args.quant,
+        quant_modules=args.quant_modules,
+        quant_scope=args.quant_scope,
+        quant_compute_dtype=args.quant_compute_dtype,
+        quant_include_vision=args.quant_include_vision
     )
 
     # 추론 모드 및 성능 옵션
@@ -268,6 +268,12 @@ def main():
     if args.live_view:
         cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 
+    # 비디오 저장 준비
+    save_video = args.save_video_dir is not None
+    if save_video:
+        os.makedirs(args.save_video_dir, exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*args.video_fourcc)
+
     try:
         for episode in tqdm.trange(total_episodes):
             obs_window = deque(maxlen=2)
@@ -280,8 +286,18 @@ def main():
             obs_window.append(np.array(img))
 
             if args.live_view:
-                cv2.imshow(window_name, img[..., ::-1])  # RGB -> BGR
+                cv2.imshow(window_name, img[..., ::-1])
                 cv2.waitKey(1)
+
+            # 비디오 라이터 준비
+            writer = None
+            if save_video:
+                h, w = img.shape[:2]
+                ckpt_tag = os.path.basename(args.pretrained_path or "ckpt")
+                out_name = f"{ckpt_tag}__{args.env_id}__ep{episode+1:02d}.mp4"
+                out_path = os.path.join(args.save_video_dir, out_name)
+                writer = cv2.VideoWriter(out_path, fourcc, args.video_fps, (w, h))
+                writer.write(img[..., ::-1])  # RGB->BGR
 
             # proprio
             proprio = obs['agent']['qpos'][:, :-1]
@@ -302,7 +318,7 @@ def main():
                 with torch.amp.autocast('cuda', enabled=(device == "cuda"), dtype=torch_dtype):
                     actions = policy.step(proprio, images, text_embed).squeeze(0).cpu().numpy()
 
-                # 64-step 예측을 down 샘플 (기본 4 → 16회 실행)
+                # downsample
                 actions = actions[::down, :]
 
                 for idx in range(actions.shape[0]):
@@ -317,6 +333,8 @@ def main():
                         if args.live_view:
                             cv2.imshow(window_name, img[..., ::-1])
                             cv2.waitKey(1)
+                        if writer is not None:
+                            writer.write(img[..., ::-1])
                     except RuntimeError:
                         pass
 
@@ -330,6 +348,9 @@ def main():
                         break
 
             print(f"Trial {episode+1} finished, success: {info.get('success', False)}, steps: {global_steps}")
+
+            if writer is not None:
+                writer.release()
 
     finally:
         if args.live_view:
