@@ -1,6 +1,12 @@
+# Technical Report with LLM
+
+[![Open in DeepWiki](https://img.shields.io/badge/Open%20in-DeepWiki-blue?logo=book&logoColor=white)](https://app.devin.ai/wiki/MK040412/RDT-1B-Ablation#1)
+
+---
+
 # Robotics Diffusion Transformer (RDT)
 
-This repository contains the code for the Robotics Diffusion Transformer (RDT), a powerful model for robotic manipulation tasks. This README provides instructions on how to set up the environment, use pre-trained models, and perform evaluation and quantization.
+This repository contains the code for the Robotics Diffusion Transformer (RDT). This README provides instructions on how to set up the environment, use pre-trained models, and perform evaluation and quantization.
 
 ## 1. Installation
 
