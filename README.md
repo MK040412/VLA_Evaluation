@@ -45,7 +45,8 @@ You can evaluate the performance of the RDT model on the ManiSkill benchmark usi
 
 ```bash
 # Run the evaluation script
-python eval_sim/eval_rdt_maniskill.py --model-path pretrained_models/rdt/ablate_w2_uniform_pc_sym.pt
+python -m  eval_sim.eval_rdt_maniskill --pretrained_path pretrained_models/rdt/mp_rank_00_model_states.pt --live-view
+
 ```
 This script will run the evaluation and print the success rate and other metrics to the console.
 
