@@ -8,8 +8,7 @@ mkdir -p "$RESULT_ROOT/videos" "$RESULT_ROOT/logs"
 rm -rf ./quantized_checkpoints_6bit
 
 # Base command for evaluation
-#BASE_EVAL_CMD="python -m scripts.eval_qunat_rdt_maniskill --pretrained_path pretrained_models/rdt/mp_rank_00_model_states.pt --num-traj 25 --only-count-success --video-fps 20"
-BASE_EVAL_CMD="python -m scripts.eval_qunat_rdt_maniskill --pretrained_path pretrained_models/rdt/mp_rank_00_model_states.pt --num-traj 25 --video-fps 20"
+BASE_EVAL_CMD="python -m scripts.eval_qunat_rdt_maniskill --pretrained_path pretrained_models/rdt/mp_rank_00_model_states.pt --num-traj 25 --only-count-success --video-fps 20"
 
 TASKS=(
     "PickCube-v1"
