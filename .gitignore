@@ -1,6 +1,6 @@
 
-
-
+env/
+**/__pycache__/
 # Ignore video files
 *.mp4
 videos_ablation/
