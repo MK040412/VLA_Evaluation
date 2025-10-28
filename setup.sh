@@ -23,6 +23,9 @@ fi
 
 source "$ENV_DIR/bin/activate"
 uv pip install -r requirements.txt
+
+git submodule update --init --recursive
+
 #uv pip install lerobot==0.4.0 
 #uv pip uninstall opencv-python opencv-python-headless opencv-contrib-python
 #uv pip install opencv-python==4.12.0.88
