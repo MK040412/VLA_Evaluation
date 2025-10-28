@@ -1,0 +1,3 @@
+[submodule "src/evaluation/diffusion_policy"]
+	path = src/evaluation/diffusion_policy
+	url = https://github.com/LBG21/diffusion_policy.git
