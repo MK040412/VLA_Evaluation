@@ -12,7 +12,7 @@ import cv2
 import imageio
 from functools import partial
 
-from src.evaluation.diffusion_policy.workspace.robotworkspace import RobotWorkspace
+from diffusion_policy.workspace.robotworkspace import RobotWorkspace
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
@@ -67,7 +67,7 @@ env = gym.make(
     sim_backend=args.sim_backend
 )
 
-# from src.evaluation.diffusion_policy.workspace.robotworkspace import RobotWorkspace
+from diffusion_policy.workspace.robotworkspace import RobotWorkspace
 import hydra
 import dill
 
