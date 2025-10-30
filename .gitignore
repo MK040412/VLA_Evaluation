@@ -10,6 +10,7 @@ pretrained_models/
 
 # Ignore results and generated images
 results/
+result*
 *.png
 
 # Ignore IDE and temporary files

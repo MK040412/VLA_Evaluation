@@ -23,6 +23,7 @@ fi
 
 source "$ENV_DIR/bin/activate"
 uv pip install -r requirements.txt
+uv pip install --no-build-isolation flash-attn
 
 git submodule update --init --recursive
 

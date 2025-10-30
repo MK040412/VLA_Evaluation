@@ -1,7 +1,7 @@
 mani-skill==3.0.0b21
 transformers>=4.57.1
 num2words==0.5.14
-tensorflow==2.20.0
+
 scripts==3.0
 torchvision==0.24.0
 diffusers==0.35.2
@@ -11,3 +11,20 @@ dill==0.4.0
 einops==0.8.1
 zarr==2.18.3
 pandas==2.3.3
+
+tf-keras==2.15.0
+tensorflow == 2.15.0
+tensorflow_probability == 0.23.0
+
+jax == 0.4.20
+jaxlib==0.4.20
+flax == 0.7.5
+distrax == 0.1.5
+ml_dtypes == 0.2.0
+ml_collections >= 0.1.0
+scipy==1.10.1
+gym >= 0.26
+plotly==6.3.1
+wandb==0.22.3
+
+dlimp @ git+https://github.com/kvablack/dlimp@5edaa4691567873d495633f2708982b42edf1972
