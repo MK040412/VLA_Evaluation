@@ -23,9 +23,10 @@ fi
 
 source "$ENV_DIR/bin/activate"
 uv pip install -r requirements.txt
-uv pip install --no-build-isolation flash-attn
+uv pip install --no-cache-dir --verbose --no-build-isolation flash-attn
 
 git submodule update --init --recursive
+git config commit.template commit_msg_template.txt
 
 #uv pip install lerobot==0.4.0 
 #uv pip uninstall opencv-python opencv-python-headless opencv-contrib-python
