@@ -228,7 +228,7 @@ class RDT2Policy:
             print(f"[INFO] Loading normalizer from {normalizer_path}...")
             try:
                 from models.normalizer import LinearNormalizer
-                self.normalizer = LinearNormalizer.from_pretrained(normalizer_path)
+                self.normalizer = LinearNormalizer.load(normalizer_path)
             except ImportError:
                 print("[WARN] normalizer module not found")
 
