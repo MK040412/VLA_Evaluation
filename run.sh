@@ -183,8 +183,11 @@ case $MODEL in
         ;;
     rdt2)
         download_rdt2
+        # Create approach-specific output directory
+        RDT2_OUTPUT_DIR="${OUTPUT_DIR}/rdt2_${APPROACH}_ps${POS_SCALE}_rs${ROT_SCALE}"
         echo "[INFO] Evaluating RDT-2 on $ENV_ID..."
         echo "[INFO] Approach: $APPROACH, pos_scale: $POS_SCALE, rot_scale: $ROT_SCALE"
+        echo "[INFO] Output directory: $RDT2_OUTPUT_DIR"
         python -m src.evaluation.eval_rdt2 \
             --env-id $ENV_ID \
             --pretrained_path robotics-diffusion-transformer/RDT2-VQ \
@@ -195,7 +198,7 @@ case $MODEL in
             --rot-scale "$ROT_SCALE" \
             $SAVE_VIDEO \
             $LIVE_VIEW \
-            --output-dir "$OUTPUT_DIR"
+            --output-dir "$RDT2_OUTPUT_DIR"
         ;;
     dp)
         download_dp
