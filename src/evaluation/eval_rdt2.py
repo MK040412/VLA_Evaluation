@@ -561,6 +561,22 @@ class RDT2Policy:
             try:
                 from models.normalizer import LinearNormalizer
                 self.normalizer = LinearNormalizer.load(normalizer_path)
+
+                # DEBUG: Print normalizer statistics
+                print("[DEBUG NORMALIZER] Normalizer loaded. Checking statistics...")
+                if hasattr(self.normalizer, 'params_dict'):
+                    for key, params in self.normalizer.params_dict.items():
+                        print(f"[DEBUG NORMALIZER] Key: {key}")
+                        if hasattr(params, 'scale'):
+                            print(f"  scale shape: {params.scale.shape}, range: [{params.scale.min():.6f}, {params.scale.max():.6f}]")
+                        if hasattr(params, 'offset'):
+                            print(f"  offset shape: {params.offset.shape}, range: [{params.offset.min():.6f}, {params.offset.max():.6f}]")
+                        if hasattr(params, 'input_stats'):
+                            stats = params.input_stats
+                            if 'min' in stats:
+                                print(f"  input_stats min[:10]: {stats['min'][:10].tolist()}")
+                            if 'max' in stats:
+                                print(f"  input_stats max[:10]: {stats['max'][:10].tolist()}")
             except ImportError:
                 print("[WARN] normalizer module not found")
 
