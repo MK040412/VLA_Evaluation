@@ -298,11 +298,11 @@ def main():
     set_seeds(args.random_seed)
 
     # ---------- Gym env ----------
-    # Set SAPIEN render device before creating env
-    import sapien
-    render_device = os.environ.get("MANI_SKILL_RENDER_DEVICE", None)
-    if render_device == "cpu":
-        sapien.render.set_global_config(device="cpu")
+    # Check if we should disable rendering (for headless environments without GPU Vulkan)
+    if os.environ.get("MANI_SKILL_NO_RENDER", "0") == "1":
+        args.render_mode = "sensors"  # state-based, no visual rendering
+        args.save_video = False
+        print("[INFO] Rendering disabled (MANI_SKILL_NO_RENDER=1)")
 
     try:
         env = gym.make(
