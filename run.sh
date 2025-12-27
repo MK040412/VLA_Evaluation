@@ -133,7 +133,8 @@ download_octo() {
     fi
 }
 
-export PYTHONPATH=$(pwd)/src/evaluation
+# RDT2 must be in PYTHONPATH for internal imports (data.umi, models.normalizer, etc.)
+export PYTHONPATH=$(pwd)/RDT2:$(pwd)/src/evaluation:$PYTHONPATH
 
 LANG_EMBEDS_PATH=pretrained_models/lang_embeds/text_embed_${ENV_ID}.pt
 
@@ -183,7 +184,7 @@ case $MODEL in
         ;;
     octo)
         download_octo
-        export PYTHONPATH=$(pwd)/src/evaluation/octo
+        export PYTHONPATH=$(pwd)/RDT2:$(pwd)/src/evaluation/octo:$PYTHONPATH
         echo "[INFO] Evaluating Octo on $ENV_ID..."
         python -m src.evaluation.eval_octo \
             --env-id $ENV_ID \
