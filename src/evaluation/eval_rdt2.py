@@ -260,7 +260,13 @@ class RDT2Policy:
                 # Resize to 384x384
                 if img.shape[:2] != (384, 384):
                     img = cv2.resize(img, (384, 384))
-                img = img.reshape(1, 384, 384, 3)
+                # Convert to torch tensor (batch_predict_action expects torch tensors)
+                img = torch.from_numpy(img).to(self.device)
+                img = img.unsqueeze(0)  # (1, 384, 384, 3)
+            elif torch.is_tensor(img):
+                if img.ndim == 3:
+                    img = img.unsqueeze(0)
+                img = img.to(self.device)
             obs[f"camera{i}_rgb"] = img
 
         try:
