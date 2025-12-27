@@ -17,6 +17,9 @@ usage() {
     echo "  --output-dir  Video output directory (default: videos)"
     echo ""
     echo "RDT-2 specific options:"
+    echo "  --robot       Robot to use [default: panda_wristcam]"
+    echo "                Options: panda|panda_wristcam|xarm6_robotiq_wristcam"
+    echo "                panda_wristcam has hand_camera for wrist view (recommended)"
     echo "  --approach    Action conversion approach [default: delta]"
     echo "                Options: delta|raw|rdt2_style|direct|vae_raw|fix_scale|vae_normalize"
     echo "                  delta       - Compute deltas between consecutive predictions"
@@ -54,6 +57,7 @@ OUTPUT_DIR="videos"
 APPROACH="delta"
 POS_SCALE="1.0"
 ROT_SCALE="1.0"
+ROBOT="panda_wristcam"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -83,6 +87,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --rot-scale)
             ROT_SCALE="$2"
+            shift 2
+            ;;
+        --robot)
+            ROBOT="$2"
             shift 2
             ;;
         *)
@@ -184,12 +192,14 @@ case $MODEL in
     rdt2)
         download_rdt2
         # Create approach-specific output directory
-        RDT2_OUTPUT_DIR="${OUTPUT_DIR}/rdt2_${APPROACH}_ps${POS_SCALE}_rs${ROT_SCALE}"
+        RDT2_OUTPUT_DIR="${OUTPUT_DIR}/rdt2_${ROBOT}_${APPROACH}_ps${POS_SCALE}_rs${ROT_SCALE}"
         echo "[INFO] Evaluating RDT-2 on $ENV_ID..."
+        echo "[INFO] Robot: $ROBOT"
         echo "[INFO] Approach: $APPROACH, pos_scale: $POS_SCALE, rot_scale: $ROT_SCALE"
         echo "[INFO] Output directory: $RDT2_OUTPUT_DIR"
         python -m src.evaluation.eval_rdt2 \
             --env-id $ENV_ID \
+            --robot "$ROBOT" \
             --pretrained_path robotics-diffusion-transformer/RDT2-VQ \
             --vae_path robotics-diffusion-transformer/RVQActionTokenizer \
             --normalizer_path pretrained_models/rdt2/umi_normalizer_wo_downsample_indentity_rot.pt \

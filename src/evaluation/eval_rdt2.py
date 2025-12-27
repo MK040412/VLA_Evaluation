@@ -596,6 +596,9 @@ def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--env-id", type=str, default="PickCube-v1",
                         help="Environment to run")
+    parser.add_argument("--robot", type=str, default="panda_wristcam",
+                        choices=["panda", "panda_wristcam", "xarm6_robotiq_wristcam"],
+                        help="Robot to use. panda_wristcam has hand_camera for wrist view")
     parser.add_argument("-o", "--obs-mode", type=str, default="rgb")
     parser.add_argument("-n", "--num-traj", type=int, default=25)
     parser.add_argument("--only-count-success", action="store_true")
@@ -832,6 +835,8 @@ def main():
     # Use pd_ee_delta_pose for RDT-2 (outputs EE poses, not joint positions)
     # RDT-2 expects 384x384 images from wrist cameras
     sensor_cfg = dict(shader_pack=args.shader, width=384, height=384)
+    print(f"[INFO] Using robot: {args.robot}")
+
     try:
         env = gym.make(
             args.env_id,
@@ -839,6 +844,7 @@ def main():
             control_mode="pd_ee_delta_pose",
             render_mode=args.render_mode,
             reward_mode="dense" if args.reward_mode is None else args.reward_mode,
+            robot_uids=args.robot,
             sensor_configs=sensor_cfg,
             human_render_camera_configs=dict(shader_pack=args.shader),
             viewer_camera_configs=dict(shader_pack=args.shader),
@@ -852,6 +858,7 @@ def main():
             control_mode="pd_ee_delta_pose",
             render_mode=args.render_mode,
             reward_mode="dense" if args.reward_mode is None else args.reward_mode,
+            robot_uids=args.robot,
             sensor_configs=sensor_cfg,
             human_render_camera_configs=dict(shader_pack=args.shader),
             viewer_camera_configs=dict(shader_pack=args.shader),
@@ -900,22 +907,33 @@ def main():
     if args.live_view:
         cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 
+    # Determine which camera to use for model input
+    # panda_wristcam has hand_camera (wrist view), others only have base_camera
+    use_hand_camera = args.robot in ["panda_wristcam", "xarm6_robotiq_wristcam"]
+    model_camera = "hand_camera" if use_hand_camera else "base_camera"
+    print(f"[INFO] Using {model_camera} for model input (wrist view: {use_hand_camera})")
+
     try:
         for episode in tqdm.trange(total_episodes):
-            obs_window = deque(maxlen=2)
+            obs_window = deque(maxlen=2)  # For model input (wrist camera)
             obs, _ = env.reset(seed=episode + base_seed)
 
-            # 첫 프레임: sensor_data에서 직접 추출 (384x384)
-            # RDT-2는 wrist camera를 기대하지만, ManiSkill에는 base_camera만 있음
-            img = _extract_rgb_from_sensor_data(obs, "base_camera")
-            if img is None:
-                # Fallback to render() if sensor_data not available
+            # 모델 입력용: hand_camera (wrist view) 사용
+            model_img = _extract_rgb_from_sensor_data(obs, model_camera)
+            if model_img is None:
+                # Fallback to base_camera
+                model_img = _extract_rgb_from_sensor_data(obs, "base_camera")
+            if model_img is None:
                 frame_any = env.render()
-                img = _extract_rgb(frame_any, obs)
-            obs_window.append(np.array(img))
+                model_img = _extract_rgb(frame_any, obs)
+            obs_window.append(np.array(model_img))
 
+            # 시각화용: base_camera (third-person view) 사용
             if args.live_view:
-                cv2.imshow(window_name, img[..., ::-1])  # RGB -> BGR
+                view_img = _extract_rgb_from_sensor_data(obs, "base_camera")
+                if view_img is None:
+                    view_img = model_img
+                cv2.imshow(window_name, view_img[..., ::-1])  # RGB -> BGR
                 cv2.waitKey(1)
 
             global_steps = 0
@@ -926,10 +944,10 @@ def main():
 
             while global_steps < MAX_EPISODE_STEPS and not done:
                 # Prepare images for RDT-2 (expects 2 wrist cameras)
-                # Since ManiSkill only has base_camera, we duplicate it
+                # Use hand_camera (wrist view), duplicate if only 1
                 images = list(obs_window)
                 if len(images) < 2:
-                    images = images + [images[-1]]  # Duplicate if only 1
+                    images = images + [images[-1]]  # Duplicate wrist view
 
                 # 모델 추론
                 try:
@@ -977,20 +995,27 @@ def main():
                     action = maniskill_actions[idx]
                     obs, reward, terminated, truncated, info = env.step(action)
 
-                    # 다음 프레임: sensor_data에서 직접 추출 (384x384)
-                    img = _extract_rgb_from_sensor_data(obs, "base_camera")
-                    if img is None:
-                        # Fallback to render()
+                    # 모델 입력용: hand_camera (wrist view) 추출
+                    model_img = _extract_rgb_from_sensor_data(obs, model_camera)
+                    if model_img is None:
+                        model_img = _extract_rgb_from_sensor_data(obs, "base_camera")
+                    if model_img is None:
                         frame_any = env.render()
                         try:
-                            img = _extract_rgb(frame_any, obs)
+                            model_img = _extract_rgb(frame_any, obs)
                         except RuntimeError:
-                            img = None
+                            model_img = None
 
-                    if img is not None:
-                        obs_window.append(img)
-                        if args.live_view:
-                            cv2.imshow(window_name, img[..., ::-1])
+                    if model_img is not None:
+                        obs_window.append(model_img)
+
+                    # 시각화용: base_camera (third-person view)
+                    if args.live_view:
+                        view_img = _extract_rgb_from_sensor_data(obs, "base_camera")
+                        if view_img is None:
+                            view_img = model_img
+                        if view_img is not None:
+                            cv2.imshow(window_name, view_img[..., ::-1])
                             cv2.waitKey(1)
 
                     global_steps += 1
