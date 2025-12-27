@@ -785,25 +785,56 @@ class RDT2Policy:
                 img = img.to(self.device)
             obs[f"camera{i}_rgb"] = img
 
-        # Determine skip_normalizer and fix_normalizer_scale based on approach
-        skip_normalizer = (approach == "vae_raw")
-        fix_normalizer_scale = (approach == "fix_scale")
-
         try:
             from utils import batch_predict_action
+
+            # For vae_raw approach, we need to bypass the normalizer
+            # We do this by temporarily replacing the normalizer with an identity function
+            original_normalizer = self.normalizer
+
+            if approach == "vae_raw":
+                # Create a dummy normalizer that returns input unchanged
+                class IdentityNormalizer:
+                    def __getitem__(self, key):
+                        return self
+                    def unnormalize(self, x):
+                        return x  # Return as-is
+                self.normalizer = IdentityNormalizer()
+            elif approach == "fix_scale":
+                # Fix small scales in normalizer before prediction
+                if self.normalizer is not None and hasattr(self.normalizer, 'params_dict'):
+                    import copy
+                    # Deep copy to avoid modifying original
+                    try:
+                        for key in self.normalizer.params_dict:
+                            params = self.normalizer.params_dict[key]
+                            if hasattr(params, 'scale'):
+                                # Replace too-small scales with 1.0
+                                mask = params.scale.abs() < 0.01
+                                if mask.any():
+                                    params.scale.data[mask] = 1.0
+                                    print(f"[DEBUG] Fixed {mask.sum()} small scale values in {key}")
+                    except Exception as e:
+                        print(f"[WARN] Could not fix normalizer scale: {e}")
+
+            # Use modified normalizer for the call
+            normalizer_to_use = self.normalizer
+
             result = batch_predict_action(
                 self.model,
                 self.processor,
                 self.vae,
-                self.normalizer,
+                normalizer_to_use,
                 examples=[{"obs": obs, "meta": obs["meta"]}],
                 valid_action_id_length=self.valid_action_id_length,
                 apply_jpeg_compression=True,
                 instruction=instruction,
-                skip_normalizer=skip_normalizer,
-                fix_normalizer_scale=fix_normalizer_scale,
             )
-            return result["action_pred"][0]  # (24, 20)
+
+            # Restore original normalizer
+            self.normalizer = original_normalizer
+
+            return result["action_pred"][0]  # (24, 20) - use first arm only [:, :10]
         except ImportError:
             raise RuntimeError("RDT2 utils not found. Clone https://github.com/thu-ml/RDT2")
 
@@ -938,6 +969,7 @@ def main():
 
             global_steps = 0
             done = False
+            info = {}  # Initialize info to avoid UnboundLocalError
 
             prev_pos = None
             prev_euler = None
