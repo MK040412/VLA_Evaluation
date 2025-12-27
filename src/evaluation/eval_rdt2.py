@@ -1,4 +1,5 @@
-# eval_sim/eval_rdt_maniskill.py
+# eval_sim/eval_rdt2_maniskill.py
+# RDT-2 (Qwen2.5-VL-7B based) evaluation script for ManiSkill
 
 from typing import Optional, Any
 import sys
@@ -14,7 +15,6 @@ from gymnasium.wrappers.time_limit import TimeLimit
 import numpy as np
 import torch
 from PIL import Image
-import yaml
 import tqdm
 import cv2  # live view
 
@@ -22,7 +22,14 @@ from mani_skill.envs.sapien_env import BaseEnv  # noqa: F401
 from mani_skill.utils import common, gym_utils   # noqa: F401
 from mani_skill.utils.wrappers.record import RecordEpisode
 
-from src.model.maniskill_model import create_model
+# RDT-2 dependencies
+try:
+    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+    HAS_RDT2_DEPS = True
+except ImportError:
+    HAS_RDT2_DEPS = False
+    print("[WARN] RDT-2 dependencies not found. Install transformers>=4.40 and flash-attn")
+
 
 # -----------------------------
 # Helpers to robustly read RGBs
@@ -90,6 +97,16 @@ def _extract_rgb(frame: Any, obs: Optional[dict] = None) -> np.ndarray:
     )
 
 
+# Task instructions for ManiSkill environments
+TASK_INSTRUCTIONS = {
+    "PickCube-v1": "Pick up the cube.",
+    "PushCube-v1": "Push the cube to the target.",
+    "StackCube-v1": "Stack the cubes.",
+    "PegInsertionSide-v1": "Insert the peg into the hole.",
+    "PlugCharger-v1": "Plug in the charger.",
+}
+
+
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--env-id", type=str, default="PickCube-v1",
@@ -103,19 +120,18 @@ def parse_args(args=None):
                         help="'rgb_array' 권장 (human은 모델 입력 프레임 제공 안 함)")
     parser.add_argument("--shader", default="default", type=str)
     parser.add_argument("--num-procs", type=int, default=1)
-    parser.add_argument("--pretrained_path", type=str, default=None,
-                        help="Path to the pretrained model (.pt or .safetensors)")
+    parser.add_argument("--pretrained_path", type=str,
+                        default="robotics-diffusion-transformer/RDT2-VQ",
+                        help="Path or HF model ID for RDT-2")
+    parser.add_argument("--vae_path", type=str,
+                        default="robotics-diffusion-transformer/RVQActionTokenizer",
+                        help="Path or HF model ID for RVQ VAE")
+    parser.add_argument("--normalizer_path", type=str,
+                        default=None,
+                        help="Path to normalizer .pt file")
     parser.add_argument("--random_seed", type=int, default=0)
-
-    # 언어 임베딩/인코더/비전 설정
-    parser.add_argument("--pretrained_text_encoder_name_or_path", type=str, default=None,
-                        help="텍스트 인코더 ID/경로. precomputed/skip로 주면 T5 로딩을 건너뜀")
-    parser.add_argument("--lang_embeddings_path", type=str, default=None,
-                        help="사전계산 언어 임베딩(.pt) 경로. 지정하지 않으면 text_embed_<ENV>.pt 자동 탐색")
-    parser.add_argument("--pretrained_vision_encoder_name_or_path", type=str,
-                        default="google/siglip-so400m-patch14-384", help="비전 인코더 ID/경로")
-    parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16"],
-                        help="모델 추론 dtype")
+    parser.add_argument("--instruction", type=str, default=None,
+                        help="Custom instruction for the task")
 
     # 렌더링
     parser.add_argument("--live-view", action="store_true",
@@ -132,22 +148,12 @@ def parse_args(args=None):
     # 에피소드 길이/스텝
     parser.add_argument("--max-steps", type=int, default=400,
                         help="에피소드 최대 스텝 수(TimeLimit). ManiSkill 기본 50을 덮어씀.")
-    parser.add_argument("--action-downsample", type=int, default=4,
-                        help="RDT 64-step 예측에서 몇 스텝마다 실행할지(기본 4 → 16회 실행). 1로 낮추면 더 오래 실행.")
+    parser.add_argument("--action-downsample", type=int, default=1,
+                        help="RDT-2 24-step 예측에서 몇 스텝마다 실행할지")
 
-    # (선택) 양자화 아블레이션 옵션
-    parser.add_argument("--quant", type=str, default="none",
-                        choices=["none", "8bit", "4bit"], help="weight-only 양자화 모드")
-    parser.add_argument("--quant-scope", type=str, default="all",
-                        choices=["all", "attn", "ffn"], help="양자화 대상 범위")
-    parser.add_argument("--quant-compute-dtype", type=str, default=None,
-                        choices=[None, "fp16", "bf16", "fp32"],
-                        help="bnb 연산 dtype(활성/계산 경로)")
-    parser.add_argument("--quant-include-vision", action="store_true",
-                        help="SigLIP 비전 인코더도 양자화")
-
-    parser.add_argument("--quant-modules", type=str, nargs='*', default=None,
-                        help="양자화할 특정 모듈 이름 리스트 (공백으로 구분)")
+    # dtype
+    parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"],
+                        help="모델 추론 dtype")
 
     return parser.parse_args(args)
 
@@ -162,29 +168,6 @@ def set_seeds(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def load_lang_embed(env_id: str, explicit_path: Optional[str]):
-    candidates = []
-    if explicit_path is not None:
-        candidates.append(explicit_path)
-    candidates += [
-        f'./text_embed_{env_id}.pt',
-        f'lang_embeds/text_embed_{env_id}.pt',
-        f'data/text_embed_{env_id}.pt',
-    ]
-    for p in candidates:
-        if p and os.path.exists(p):
-            print(f"[INFO] Using precomputed language embedding: {p}")
-            emb = torch.load(p, map_location="cpu")
-            # (L, D) → (1, L, D) 형태 보정
-            if isinstance(emb, torch.Tensor) and emb.ndim == 2:
-                emb = emb.unsqueeze(0)
-            return emb
-    raise FileNotFoundError(
-        f"Precomputed language embedding not found. "
-        f"Pass --lang_embeddings_path or place text_embed_{env_id}.pt at repo root."
-    )
-
-
 def _force_time_limit(env: gym.Env, max_steps: int) -> gym.Env:
     """ManiSkill 기본 50 스텝 TimeLimit을 원하는 값으로 강제 교체."""
     cur = env
@@ -193,8 +176,118 @@ def _force_time_limit(env: gym.Env, max_steps: int) -> gym.Env:
     return TimeLimit(cur, max_episode_steps=max_steps)
 
 
+class RDT2Policy:
+    """Wrapper for RDT-2 model inference."""
+
+    def __init__(
+        self,
+        model_path: str = "robotics-diffusion-transformer/RDT2-VQ",
+        vae_path: str = "robotics-diffusion-transformer/RVQActionTokenizer",
+        normalizer_path: Optional[str] = None,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        self.device = device
+        self.dtype = dtype
+
+        print(f"[INFO] Loading RDT-2 model from {model_path}...")
+        self.processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
+
+        # Try flash attention, fallback to sdpa
+        try:
+            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_path,
+                torch_dtype=dtype,
+                attn_implementation="flash_attention_2",
+                device_map=device
+            ).eval()
+        except Exception as e:
+            print(f"[WARN] Flash attention failed ({e}), using sdpa...")
+            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_path,
+                torch_dtype=dtype,
+                attn_implementation="sdpa",
+                device_map=device
+            ).eval()
+
+        # Load VAE
+        print(f"[INFO] Loading RVQ VAE from {vae_path}...")
+        try:
+            from vqvae import MultiVQVAE
+            self.vae = MultiVQVAE.from_pretrained(vae_path).eval()
+            self.vae = self.vae.to(device=device, dtype=torch.float32)
+            self.valid_action_id_length = self.vae.pos_id_len + self.vae.rot_id_len + self.vae.grip_id_len
+        except ImportError:
+            print("[WARN] vqvae module not found. Clone https://github.com/thu-ml/RDT2")
+            self.vae = None
+            self.valid_action_id_length = None
+
+        # Load normalizer
+        self.normalizer = None
+        if normalizer_path and os.path.exists(normalizer_path):
+            print(f"[INFO] Loading normalizer from {normalizer_path}...")
+            try:
+                from models.normalizer import LinearNormalizer
+                self.normalizer = LinearNormalizer.from_pretrained(normalizer_path)
+            except ImportError:
+                print("[WARN] normalizer module not found")
+
+    def predict_action(
+        self,
+        images: list,
+        instruction: str,
+    ) -> np.ndarray:
+        """
+        Predict action chunk from images and instruction.
+
+        Args:
+            images: List of PIL Images or numpy arrays (expects 2 cameras: camera0, camera1)
+            instruction: Text instruction for the task
+
+        Returns:
+            action_chunk: (T, D) numpy array where T=24, D=20 (or adapted for ManiSkill)
+        """
+        if self.vae is None:
+            raise RuntimeError("VAE not loaded. Please install RDT2 dependencies.")
+
+        # Prepare observation dict
+        obs = {"meta": {"num_camera": len(images)}}
+        for i, img in enumerate(images):
+            if isinstance(img, np.ndarray):
+                # Ensure uint8
+                if img.dtype != np.uint8:
+                    img = (img * 255).astype(np.uint8) if img.max() <= 1 else img.astype(np.uint8)
+                # Resize to 384x384
+                if img.shape[:2] != (384, 384):
+                    img = cv2.resize(img, (384, 384))
+                img = img.reshape(1, 384, 384, 3)
+            obs[f"camera{i}_rgb"] = img
+
+        try:
+            from utils import batch_predict_action
+            result = batch_predict_action(
+                self.model,
+                self.processor,
+                self.vae,
+                self.normalizer,
+                examples=[{"obs": obs, "meta": obs["meta"]}],
+                valid_action_id_length=self.valid_action_id_length,
+                apply_jpeg_compression=True,
+                instruction=instruction
+            )
+            return result["action_pred"][0]  # (24, 20)
+        except ImportError:
+            raise RuntimeError("RDT2 utils not found. Clone https://github.com/thu-ml/RDT2")
+
+
 def main():
     args = parse_args()
+
+    if not HAS_RDT2_DEPS:
+        print("[ERROR] RDT-2 dependencies not available. Please install:")
+        print("  pip install transformers>=4.40 flash-attn")
+        print("  git clone https://github.com/thu-ml/RDT2")
+        return
 
     # 사람이 보기 위해 human을 주더라도 모델 입력을 위해 rgb_array가 필요
     if args.render_mode != "rgb_array":
@@ -239,46 +332,27 @@ def main():
             env,
             output_dir=args.output_dir,
             save_trajectory=True,
-            trajectory_name=f"trajectory_{args.env_id}_rdt",
+            trajectory_name=f"trajectory_{args.env_id}_rdt2",
             save_video=True,
             video_fps=args.video_fps
         )
         print(f"[INFO] Video recording enabled. Saving to: {args.output_dir}")
 
-    # ---------- Config ----------
-    with open('configs/base.yaml', "r") as fp:
-        config = yaml.safe_load(fp)
-
     # ---------- DType ----------
     torch_dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
 
     # ---------- Model ----------
-    policy = create_model(
-        args=config,
+    policy = RDT2Policy(
+        model_path=args.pretrained_path,
+        vae_path=args.vae_path,
+        normalizer_path=args.normalizer_path,
+        device="cuda" if torch.cuda.is_available() else "cpu",
         dtype=torch_dtype,
-        pretrained=args.pretrained_path,
-        pretrained_text_encoder_name_or_path=args.pretrained_text_encoder_name_or_path,
-        pretrained_vision_encoder_name_or_path=args.pretrained_vision_encoder_name_or_path,
-        quant_mode=args.quant,                         # "none" | "8bit" | "4bit"
-        quant_scope=args.quant_scope,                  # "all" | "attn" | "ffn"
-        quant_compute_dtype=args.quant_compute_dtype,  # None | "fp16" | "bf16" | "fp32"
-        quant_include_vision=args.quant_include_vision, # True/False
-        quant_modules=args.quant_modules
     )
 
-    # 추론 모드 및 성능 옵션
-    torch.set_float32_matmul_precision("high")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    policy.policy = policy.policy.to(device, dtype=torch_dtype)
-    if getattr(policy, "vision_model", None) is not None:
-        policy.vision_model = policy.vision_model.to(device, dtype=torch_dtype)
-    if getattr(policy, "text_model", None) is not None:
-        policy.text_model = policy.text_model.to(device, dtype=torch_dtype)
-    policy.reset()
-
-    # ---------- Precomputed language embedding ----------
-    text_embed = load_lang_embed(args.env_id, args.lang_embeddings_path)
+    # ---------- Instruction ----------
+    instruction = args.instruction or TASK_INSTRUCTIONS.get(args.env_id, "Complete the task.")
+    print(f"[INFO] Using instruction: {instruction}")
 
     # ---------- Eval loop ----------
     MAX_EPISODE_STEPS = args.max_steps
@@ -287,7 +361,7 @@ def main():
     base_seed = 20241201
     down = max(1, int(args.action_downsample))
 
-    window_name = f"RDT Live - {args.env_id}"
+    window_name = f"RDT-2 Live - {args.env_id}"
     if args.live_view:
         cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 
@@ -299,34 +373,31 @@ def main():
             # 첫 프레임
             frame_any = env.render()
             img = _extract_rgb(frame_any, obs)
-            obs_window.append(None)
             obs_window.append(np.array(img))
 
             if args.live_view:
                 cv2.imshow(window_name, img[..., ::-1])  # RGB -> BGR
                 cv2.waitKey(1)
 
-            # proprio
-            proprio = obs['agent']['qpos'][:, :-1]
-
             global_steps = 0
             done = False
 
             while global_steps < MAX_EPISODE_STEPS and not done:
-                # 이미지 6장 슬롯 준비
-                image_arrs = []
-                for window_img in obs_window:
-                    image_arrs.append(window_img)
-                    image_arrs.append(None)
-                    image_arrs.append(None)
-                images = [Image.fromarray(arr) if arr is not None else None for arr in image_arrs]
+                # Prepare images for RDT-2 (expects 2 cameras)
+                images = list(obs_window)
+                if len(images) < 2:
+                    images = images + [images[-1]]  # Duplicate if only 1
 
                 # 모델 추론
-                with torch.amp.autocast('cuda', enabled=(device == "cuda"), dtype=torch_dtype):
-                    actions = policy.step(proprio, images, text_embed).squeeze(0).cpu().numpy()
+                try:
+                    actions = policy.predict_action(images, instruction)
+                except Exception as e:
+                    print(f"[ERROR] Prediction failed: {e}")
+                    break
 
-                # 64-step 예측을 down 샘플 (기본 4 → 16회 실행)
-                actions = actions[::down, :]
+                # RDT-2 outputs (24, 20) - need to adapt to ManiSkill (8-dim action)
+                # Take first 8 dims for single arm control
+                actions = actions[::down, :8]
 
                 for idx in range(actions.shape[0]):
                     action = actions[idx]
@@ -343,7 +414,6 @@ def main():
                     except RuntimeError:
                         pass
 
-                    proprio = obs['agent']['qpos'][:, :-1]
                     global_steps += 1
 
                     if terminated or truncated:
