@@ -314,6 +314,113 @@ def convert_approach_direct(
 
 
 # =============================================================================
+# APPROACH 5: VAE raw output (skip normalizer)
+# =============================================================================
+def convert_approach_vae_raw(
+    rdt2_action: np.ndarray,
+    pos_scale: float = 1.0,
+    rot_scale: float = 1.0
+) -> np.ndarray:
+    """
+    Use raw VAE output directly (assumes normalizer was skipped).
+    VAE output is expected to be roughly in [-1, 1] range.
+
+    Args:
+        rdt2_action: (T, 20) or (T, 10) - RAW VAE output (not unnormalized)
+        pos_scale: Scale factor for position
+        rot_scale: Scale factor for rotation
+
+    Returns:
+        (T, 7) ManiSkill pd_ee_delta_pose action
+    """
+    if rdt2_action.shape[-1] == 20:
+        rdt2_action = rdt2_action[..., :10]
+
+    T = rdt2_action.shape[0]
+    maniskill_actions = np.zeros((T, 7))
+
+    for t in range(T):
+        # VAE output format: pos(3) + rot6d(6) + gripper(1)
+        pos = rdt2_action[t, :3]
+        rot6d = rdt2_action[t, 3:9]
+        gripper = rdt2_action[t, 9]
+
+        # Convert 6D rotation to euler
+        euler = rot6d_to_euler(rot6d)
+
+        # Scale and use as delta (VAE output should be small deltas)
+        delta_pos = np.clip(pos * pos_scale, -1.0, 1.0)
+        delta_euler = np.clip(euler * rot_scale, -1.0, 1.0)
+        gripper_action = np.clip(gripper, -1.0, 1.0)
+
+        maniskill_actions[t] = np.concatenate([delta_pos, delta_euler, [gripper_action]])
+
+    return maniskill_actions
+
+
+# =============================================================================
+# APPROACH 6: VAE normalize (rescale VAE output to [-1, 1])
+# =============================================================================
+def convert_approach_vae_normalize(
+    rdt2_action: np.ndarray,
+    pos_scale: float = 1.0,
+    rot_scale: float = 1.0
+) -> np.ndarray:
+    """
+    Normalize VAE output to [-1, 1] range based on observed min/max,
+    then scale for ManiSkill.
+
+    Args:
+        rdt2_action: (T, 20) or (T, 10) - VAE output (may be unnormalized with wrong scale)
+        pos_scale: Scale factor for position
+        rot_scale: Scale factor for rotation
+
+    Returns:
+        (T, 7) ManiSkill pd_ee_delta_pose action
+    """
+    if rdt2_action.shape[-1] == 20:
+        rdt2_action = rdt2_action[..., :10]
+
+    T = rdt2_action.shape[0]
+    maniskill_actions = np.zeros((T, 7))
+
+    # Get statistics for normalization
+    pos_all = rdt2_action[:, :3]
+    rot6d_all = rdt2_action[:, 3:9]
+    gripper_all = rdt2_action[:, 9]
+
+    # Normalize each component to [-1, 1] based on their range
+    def normalize_to_range(arr):
+        min_val = arr.min()
+        max_val = arr.max()
+        if max_val - min_val < 1e-8:
+            return np.zeros_like(arr)
+        return 2 * (arr - min_val) / (max_val - min_val) - 1
+
+    for t in range(T):
+        pos = rdt2_action[t, :3]
+        rot6d = rdt2_action[t, 3:9]
+        gripper = rdt2_action[t, 9]
+
+        # Normalize position based on trajectory range
+        pos_normalized = normalize_to_range(pos_all)[t]
+
+        # Convert rotation (6D -> euler)
+        euler = rot6d_to_euler(rot6d)
+
+        # Apply scaling
+        delta_pos = np.clip(pos_normalized * pos_scale, -1.0, 1.0)
+        delta_euler = np.clip(euler * rot_scale, -1.0, 1.0)
+
+        # Gripper: assume it's already reasonable
+        gripper_action = np.clip(gripper, -1.0, 1.0)
+
+        maniskill_actions[t] = np.concatenate([delta_pos, delta_euler, [gripper_action]])
+
+    return maniskill_actions
+
+
+# =============================================================================
 # Master conversion function that dispatches to appropriate approach
 # =============================================================================
 def convert_rdt2_to_maniskill_action(
@@ -350,6 +457,13 @@ def convert_rdt2_to_maniskill_action(
         return convert_approach_rdt2_style(rdt2_action, current_ee_pos, current_ee_euler, pos_scale, rot_scale)
     elif approach == "direct":
         return convert_approach_direct(rdt2_action, pos_scale, rot_scale)
+    elif approach == "vae_raw":
+        return convert_approach_vae_raw(rdt2_action, pos_scale, rot_scale)
+    elif approach == "fix_scale":
+        # fix_scale is handled at model level, use direct conversion here
+        return convert_approach_direct(rdt2_action, pos_scale, rot_scale)
+    elif approach == "vae_normalize":
+        return convert_approach_vae_normalize(rdt2_action, pos_scale, rot_scale)
     else:
         raise ValueError(f"Unknown approach: {approach}")
 
@@ -480,7 +594,8 @@ def parse_args(args=None):
 
     # Multi-approach experiment arguments
     parser.add_argument("--approach", type=str, default="delta",
-                        choices=["delta", "raw", "rdt2_style", "direct"],
+                        choices=["delta", "raw", "rdt2_style", "direct",
+                                 "vae_raw", "fix_scale", "vae_normalize"],
                         help="Action conversion approach")
     parser.add_argument("--pos-scale", type=float, default=1.0,
                         help="Position scale factor for delta/direct approaches")
@@ -584,6 +699,7 @@ class RDT2Policy:
         self,
         images: list,
         instruction: str,
+        approach: str = "delta",
     ) -> np.ndarray:
         """
         Predict action chunk from images and instruction.
@@ -591,6 +707,7 @@ class RDT2Policy:
         Args:
             images: List of PIL Images or numpy arrays (expects 2 cameras: camera0, camera1)
             instruction: Text instruction for the task
+            approach: Action conversion approach (affects normalizer handling)
 
         Returns:
             action_chunk: (T, D) numpy array where T=24, D=20 (or adapted for ManiSkill)
@@ -617,6 +734,10 @@ class RDT2Policy:
                 img = img.to(self.device)
             obs[f"camera{i}_rgb"] = img
 
+        # Determine skip_normalizer and fix_normalizer_scale based on approach
+        skip_normalizer = (approach == "vae_raw")
+        fix_normalizer_scale = (approach == "fix_scale")
+
         try:
             from utils import batch_predict_action
             result = batch_predict_action(
@@ -627,7 +748,9 @@ class RDT2Policy:
                 examples=[{"obs": obs, "meta": obs["meta"]}],
                 valid_action_id_length=self.valid_action_id_length,
                 apply_jpeg_compression=True,
-                instruction=instruction
+                instruction=instruction,
+                skip_normalizer=skip_normalizer,
+                fix_normalizer_scale=fix_normalizer_scale,
             )
             return result["action_pred"][0]  # (24, 20)
         except ImportError:
@@ -755,7 +878,7 @@ def main():
 
                 # 모델 추론
                 try:
-                    actions = policy.predict_action(images, instruction)
+                    actions = policy.predict_action(images, instruction, approach=args.approach)
                 except Exception as e:
                     print(f"[ERROR] Prediction failed: {e}")
                     break
