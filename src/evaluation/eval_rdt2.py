@@ -298,6 +298,9 @@ def main():
     set_seeds(args.random_seed)
 
     # ---------- Gym env ----------
+    # Determine render device (use CPU if Vulkan not available on GPU)
+    render_device = os.environ.get("MANI_SKILL_RENDER_DEVICE", "cuda:0")
+
     try:
         env = gym.make(
             args.env_id,
@@ -310,6 +313,7 @@ def main():
             viewer_camera_configs=dict(shader_pack=args.shader),
             sim_backend=args.sim_backend,
             max_episode_steps=args.max_steps,
+            render_device=render_device,
         )
     except TypeError:
         env = gym.make(
@@ -322,6 +326,7 @@ def main():
             human_render_camera_configs=dict(shader_pack=args.shader),
             viewer_camera_configs=dict(shader_pack=args.shader),
             sim_backend=args.sim_backend,
+            render_device=render_device,
         )
     env = _force_time_limit(env, args.max_steps)
 
