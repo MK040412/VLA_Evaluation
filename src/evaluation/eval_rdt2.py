@@ -408,8 +408,8 @@ def main():
                     break
 
                 # RDT-2 outputs (24, 20) - need to adapt to ManiSkill (8-dim action)
-                # Take first 8 dims for single arm control
-                actions = actions[::down, :8]
+                # Take first 8 dims for single arm control and convert to numpy
+                actions = actions[::down, :8].detach().cpu().numpy()
 
                 for idx in range(actions.shape[0]):
                     action = actions[idx]
