@@ -32,6 +32,128 @@ except ImportError:
 
 
 # -----------------------------
+# Rotation conversion utilities
+# -----------------------------
+def rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
+    """
+    Convert 6D rotation representation to rotation matrix.
+    rot6d: (..., 6) - two 3D vectors (first two columns of rotation matrix)
+    Returns: (..., 3, 3) rotation matrix
+    """
+    # Gram-Schmidt orthogonalization
+    a1 = rot6d[..., :3]
+    a2 = rot6d[..., 3:6]
+
+    # Normalize first vector
+    b1 = a1 / (np.linalg.norm(a1, axis=-1, keepdims=True) + 1e-8)
+
+    # Make second vector orthogonal to first
+    dot = np.sum(b1 * a2, axis=-1, keepdims=True)
+    b2 = a2 - dot * b1
+    b2 = b2 / (np.linalg.norm(b2, axis=-1, keepdims=True) + 1e-8)
+
+    # Third vector is cross product
+    b3 = np.cross(b1, b2)
+
+    # Stack to form rotation matrix
+    return np.stack([b1, b2, b3], axis=-1)
+
+
+def matrix_to_euler(mat: np.ndarray) -> np.ndarray:
+    """
+    Convert rotation matrix to euler angles (XYZ convention).
+    mat: (..., 3, 3)
+    Returns: (..., 3) euler angles in radians
+    """
+    # Handle batch dimension
+    shape = mat.shape[:-2]
+    mat = mat.reshape(-1, 3, 3)
+
+    euler = np.zeros((mat.shape[0], 3))
+
+    for i in range(mat.shape[0]):
+        m = mat[i]
+        # XYZ euler angles
+        sy = np.sqrt(m[0, 0]**2 + m[1, 0]**2)
+        singular = sy < 1e-6
+
+        if not singular:
+            euler[i, 0] = np.arctan2(m[2, 1], m[2, 2])  # roll
+            euler[i, 1] = np.arctan2(-m[2, 0], sy)       # pitch
+            euler[i, 2] = np.arctan2(m[1, 0], m[0, 0])   # yaw
+        else:
+            euler[i, 0] = np.arctan2(-m[1, 2], m[1, 1])
+            euler[i, 1] = np.arctan2(-m[2, 0], sy)
+            euler[i, 2] = 0
+
+    return euler.reshape(*shape, 3)
+
+
+def rot6d_to_euler(rot6d: np.ndarray) -> np.ndarray:
+    """Convert 6D rotation to euler angles."""
+    mat = rot6d_to_matrix(rot6d)
+    return matrix_to_euler(mat)
+
+
+def convert_rdt2_to_maniskill_action(rdt2_action: np.ndarray, prev_pos: np.ndarray = None, prev_euler: np.ndarray = None) -> np.ndarray:
+    """
+    Convert RDT-2 action (10D per arm) to ManiSkill pd_ee_delta_pose action (7D).
+
+    RDT-2 format (10D): pos(3) + rot6d(6) + gripper(1)
+    ManiSkill format (7D): delta_pos(3) + delta_euler(3) + gripper(1)
+
+    Args:
+        rdt2_action: (T, 20) or (T, 10) - RDT-2 action prediction
+        prev_pos: Previous EE position (for computing delta)
+        prev_euler: Previous EE euler angles (for computing delta)
+
+    Returns:
+        (T, 7) ManiSkill action
+    """
+    # Take first arm only (dims 0-9)
+    if rdt2_action.shape[-1] == 20:
+        rdt2_action = rdt2_action[..., :10]
+
+    T = rdt2_action.shape[0]
+    maniskill_actions = np.zeros((T, 7))
+
+    for t in range(T):
+        action = rdt2_action[t]
+
+        # Extract components
+        pos = action[:3]           # Position (3D)
+        rot6d = action[3:9]        # 6D rotation
+        gripper = action[9]        # Gripper width
+
+        # Convert rotation
+        euler = rot6d_to_euler(rot6d)
+
+        # For first step or if no previous state, use absolute (small values)
+        if prev_pos is None:
+            delta_pos = pos * 0.01  # Scale down absolute position
+            delta_euler = euler * 0.1  # Scale down rotation
+        else:
+            delta_pos = (pos - prev_pos) * 0.1
+            delta_euler = (euler - prev_euler) * 0.1
+
+        # Clip deltas to reasonable range
+        delta_pos = np.clip(delta_pos, -0.1, 0.1)
+        delta_euler = np.clip(delta_euler, -0.5, 0.5)
+
+        # Gripper: RDT-2 outputs width, ManiSkill expects -1 (close) to 1 (open)
+        # Assume RDT-2 gripper is normalized [0, 1] or similar
+        gripper_action = np.clip(gripper * 2 - 1, -1, 1)
+
+        maniskill_actions[t] = np.concatenate([delta_pos, delta_euler, [gripper_action]])
+
+        # Update previous state for next iteration
+        prev_pos = pos
+        prev_euler = euler
+
+    return maniskill_actions
+
+
+# -----------------------------
 # Helpers to robustly read RGBs
 # -----------------------------
 def _to_numpy_rgb(x: Any) -> Optional[np.ndarray]:
@@ -310,11 +432,12 @@ def main():
         args.save_video = False
         print("[INFO] Rendering disabled (MANI_SKILL_NO_RENDER=1)")
 
+    # Use pd_ee_delta_pose for RDT-2 (outputs EE poses, not joint positions)
     try:
         env = gym.make(
             args.env_id,
             obs_mode=args.obs_mode,
-            control_mode="pd_joint_pos",
+            control_mode="pd_ee_delta_pose",
             render_mode=args.render_mode,
             reward_mode="dense" if args.reward_mode is None else args.reward_mode,
             sensor_configs=dict(shader_pack=args.shader),
@@ -327,7 +450,7 @@ def main():
         env = gym.make(
             args.env_id,
             obs_mode=args.obs_mode,
-            control_mode="pd_joint_pos",
+            control_mode="pd_ee_delta_pose",
             render_mode=args.render_mode,
             reward_mode="dense" if args.reward_mode is None else args.reward_mode,
             sensor_configs=dict(shader_pack=args.shader),
@@ -394,6 +517,9 @@ def main():
             global_steps = 0
             done = False
 
+            prev_pos = None
+            prev_euler = None
+
             while global_steps < MAX_EPISODE_STEPS and not done:
                 # Prepare images for RDT-2 (expects 2 cameras)
                 images = list(obs_window)
@@ -407,12 +533,23 @@ def main():
                     print(f"[ERROR] Prediction failed: {e}")
                     break
 
-                # RDT-2 outputs (24, 20) - need to adapt to ManiSkill (8-dim action)
-                # Take first 8 dims for single arm control and convert to numpy
-                actions = actions[::down, :8].detach().cpu().numpy()
+                # RDT-2 outputs (24, 20): 2 arms × (pos(3) + rot6d(6) + gripper(1))
+                # Convert to ManiSkill pd_ee_delta_pose format (7D)
+                actions_np = actions.detach().cpu().numpy()
+                actions_np = actions_np[::down]  # Downsample temporally
 
-                for idx in range(actions.shape[0]):
-                    action = actions[idx]
+                # Convert RDT-2 format to ManiSkill format
+                maniskill_actions = convert_rdt2_to_maniskill_action(
+                    actions_np, prev_pos=prev_pos, prev_euler=prev_euler
+                )
+
+                # Update prev state from last action for next iteration
+                last_action = actions_np[-1, :10] if actions_np.shape[-1] >= 10 else actions_np[-1]
+                prev_pos = last_action[:3]
+                prev_euler = rot6d_to_euler(last_action[3:9])
+
+                for idx in range(maniskill_actions.shape[0]):
+                    action = maniskill_actions[idx]
                     obs, reward, terminated, truncated, info = env.step(action)
 
                     # 다음 프레임
