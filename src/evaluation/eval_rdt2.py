@@ -534,6 +534,54 @@ def _extract_rgb(frame: Any, obs: Optional[dict] = None) -> np.ndarray:
     )
 
 
+def _extract_rgb_from_sensor_data(obs: dict, camera_name: str = "base_camera") -> Optional[np.ndarray]:
+    """
+    Extract RGB image from ManiSkill observation sensor_data.
+
+    Args:
+        obs: ManiSkill observation dict
+        camera_name: Name of the camera to extract from
+
+    Returns:
+        (H, W, 3) numpy array or None if not found
+    """
+    if 'sensor_data' not in obs:
+        return None
+
+    sensor_data = obs['sensor_data']
+    if camera_name not in sensor_data:
+        # Try to find any camera
+        for name, data in sensor_data.items():
+            if isinstance(data, dict) and 'rgb' in data:
+                camera_name = name
+                break
+        else:
+            return None
+
+    cam_data = sensor_data[camera_name]
+    if not isinstance(cam_data, dict) or 'rgb' not in cam_data:
+        return None
+
+    rgb = cam_data['rgb']
+
+    # Convert to numpy array
+    if torch.is_tensor(rgb):
+        rgb = rgb.detach().cpu().numpy()
+
+    # Handle batch dimension: (B, H, W, C) -> (H, W, C)
+    if rgb.ndim == 4:
+        rgb = rgb[0]
+
+    # Ensure uint8
+    if rgb.dtype != np.uint8:
+        if rgb.max() <= 1.0:
+            rgb = (rgb * 255).astype(np.uint8)
+        else:
+            rgb = rgb.astype(np.uint8)
+
+    return rgb
+
+
 # Task instructions for ManiSkill environments
 TASK_INSTRUCTIONS = {
     "PickCube-v1": "Pick up the cube.",
@@ -782,6 +830,8 @@ def main():
         print("[INFO] Rendering disabled (MANI_SKILL_NO_RENDER=1)")
 
     # Use pd_ee_delta_pose for RDT-2 (outputs EE poses, not joint positions)
+    # RDT-2 expects 384x384 images from wrist cameras
+    sensor_cfg = dict(shader_pack=args.shader, width=384, height=384)
     try:
         env = gym.make(
             args.env_id,
@@ -789,7 +839,7 @@ def main():
             control_mode="pd_ee_delta_pose",
             render_mode=args.render_mode,
             reward_mode="dense" if args.reward_mode is None else args.reward_mode,
-            sensor_configs=dict(shader_pack=args.shader),
+            sensor_configs=sensor_cfg,
             human_render_camera_configs=dict(shader_pack=args.shader),
             viewer_camera_configs=dict(shader_pack=args.shader),
             sim_backend=args.sim_backend,
@@ -802,7 +852,7 @@ def main():
             control_mode="pd_ee_delta_pose",
             render_mode=args.render_mode,
             reward_mode="dense" if args.reward_mode is None else args.reward_mode,
-            sensor_configs=dict(shader_pack=args.shader),
+            sensor_configs=sensor_cfg,
             human_render_camera_configs=dict(shader_pack=args.shader),
             viewer_camera_configs=dict(shader_pack=args.shader),
             sim_backend=args.sim_backend,
@@ -855,9 +905,13 @@ def main():
             obs_window = deque(maxlen=2)
             obs, _ = env.reset(seed=episode + base_seed)
 
-            # 첫 프레임
-            frame_any = env.render()
-            img = _extract_rgb(frame_any, obs)
+            # 첫 프레임: sensor_data에서 직접 추출 (384x384)
+            # RDT-2는 wrist camera를 기대하지만, ManiSkill에는 base_camera만 있음
+            img = _extract_rgb_from_sensor_data(obs, "base_camera")
+            if img is None:
+                # Fallback to render() if sensor_data not available
+                frame_any = env.render()
+                img = _extract_rgb(frame_any, obs)
             obs_window.append(np.array(img))
 
             if args.live_view:
@@ -871,7 +925,8 @@ def main():
             prev_euler = None
 
             while global_steps < MAX_EPISODE_STEPS and not done:
-                # Prepare images for RDT-2 (expects 2 cameras)
+                # Prepare images for RDT-2 (expects 2 wrist cameras)
+                # Since ManiSkill only has base_camera, we duplicate it
                 images = list(obs_window)
                 if len(images) < 2:
                     images = images + [images[-1]]  # Duplicate if only 1
@@ -922,16 +977,21 @@ def main():
                     action = maniskill_actions[idx]
                     obs, reward, terminated, truncated, info = env.step(action)
 
-                    # 다음 프레임
-                    frame_any = env.render()
-                    try:
-                        img = _extract_rgb(frame_any, obs)
+                    # 다음 프레임: sensor_data에서 직접 추출 (384x384)
+                    img = _extract_rgb_from_sensor_data(obs, "base_camera")
+                    if img is None:
+                        # Fallback to render()
+                        frame_any = env.render()
+                        try:
+                            img = _extract_rgb(frame_any, obs)
+                        except RuntimeError:
+                            img = None
+
+                    if img is not None:
                         obs_window.append(img)
                         if args.live_view:
                             cv2.imshow(window_name, img[..., ::-1])
                             cv2.waitKey(1)
-                    except RuntimeError:
-                        pass
 
                     global_steps += 1
 
