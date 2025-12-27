@@ -95,22 +95,94 @@ def rot6d_to_euler(rot6d: np.ndarray) -> np.ndarray:
     return matrix_to_euler(mat)
 
 
-def convert_rdt2_to_maniskill_action(rdt2_action: np.ndarray, prev_pos: np.ndarray = None, prev_euler: np.ndarray = None) -> np.ndarray:
-    """
-    Convert RDT-2 action (10D per arm) to ManiSkill pd_ee_delta_pose action (7D).
+def euler_to_matrix(euler: np.ndarray) -> np.ndarray:
+    """Convert euler angles (XYZ) to rotation matrix."""
+    roll, pitch, yaw = euler[0], euler[1], euler[2]
 
-    RDT-2 format (10D): pos(3) + rot6d(6) + gripper(1)
-    ManiSkill format (7D): delta_pos(3) + delta_euler(3) + gripper(1)
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+
+    return Rz @ Ry @ Rx
+
+
+# =============================================================================
+# APPROACH 1: Delta-based conversion (original approach with configurable scale)
+# =============================================================================
+def convert_approach_delta(
+    rdt2_action: np.ndarray,
+    prev_pos: np.ndarray = None,
+    prev_euler: np.ndarray = None,
+    pos_scale: float = 1.0,
+    rot_scale: float = 1.0
+) -> np.ndarray:
+    """
+    Delta-based conversion: compute deltas between consecutive RDT-2 predictions.
 
     Args:
         rdt2_action: (T, 20) or (T, 10) - RDT-2 action prediction
-        prev_pos: Previous EE position (for computing delta)
-        prev_euler: Previous EE euler angles (for computing delta)
+        prev_pos: Previous position for first frame delta
+        prev_euler: Previous euler for first frame delta
+        pos_scale: Scale factor for position deltas
+        rot_scale: Scale factor for rotation deltas
 
     Returns:
-        (T, 7) ManiSkill action
+        (T, 7) ManiSkill pd_ee_delta_pose action
     """
-    # Take first arm only (dims 0-9)
+    if rdt2_action.shape[-1] == 20:
+        rdt2_action = rdt2_action[..., :10]
+
+    T = rdt2_action.shape[0]
+    maniskill_actions = np.zeros((T, 7))
+
+    all_pos = rdt2_action[:, :3]
+    all_rot6d = rdt2_action[:, 3:9]
+    all_gripper = rdt2_action[:, 9]
+    all_euler = np.array([rot6d_to_euler(rot6d) for rot6d in all_rot6d])
+
+    for t in range(T):
+        pos = all_pos[t]
+        euler = all_euler[t]
+        gripper = all_gripper[t]
+
+        if t == 0:
+            if prev_pos is not None and prev_euler is not None:
+                delta_pos = pos - prev_pos
+                delta_euler = euler - prev_euler
+            else:
+                delta_pos = pos * 0.1
+                delta_euler = euler * 0.1
+        else:
+            delta_pos = pos - all_pos[t - 1]
+            delta_euler = euler - all_euler[t - 1]
+
+        delta_pos_scaled = np.clip(delta_pos * pos_scale, -1.0, 1.0)
+        delta_euler_scaled = np.clip(delta_euler * rot_scale, -1.0, 1.0)
+        gripper_action = np.clip(gripper, -1.0, 1.0)
+
+        maniskill_actions[t] = np.concatenate([delta_pos_scaled, delta_euler_scaled, [gripper_action]])
+
+    return maniskill_actions
+
+
+# =============================================================================
+# APPROACH 2: Raw action (no scaling, direct use of RDT-2 output)
+# =============================================================================
+def convert_approach_raw(rdt2_action: np.ndarray) -> np.ndarray:
+    """
+    Raw conversion: use RDT-2 output directly as delta actions.
+    Assumes normalizer already produces reasonable values.
+
+    Args:
+        rdt2_action: (T, 20) or (T, 10) - RDT-2 action prediction
+
+    Returns:
+        (T, 7) ManiSkill pd_ee_delta_pose action
+    """
     if rdt2_action.shape[-1] == 20:
         rdt2_action = rdt2_action[..., :10]
 
@@ -118,39 +190,168 @@ def convert_rdt2_to_maniskill_action(rdt2_action: np.ndarray, prev_pos: np.ndarr
     maniskill_actions = np.zeros((T, 7))
 
     for t in range(T):
-        action = rdt2_action[t]
+        pos = rdt2_action[t, :3]
+        rot6d = rdt2_action[t, 3:9]
+        gripper = rdt2_action[t, 9]
 
-        # Extract components
-        pos = action[:3]           # Position (3D)
-        rot6d = action[3:9]        # 6D rotation
-        gripper = action[9]        # Gripper width
-
-        # Convert rotation
         euler = rot6d_to_euler(rot6d)
 
-        # For first step or if no previous state, use absolute (small values)
-        if prev_pos is None:
-            delta_pos = pos * 0.01  # Scale down absolute position
-            delta_euler = euler * 0.1  # Scale down rotation
-        else:
-            delta_pos = (pos - prev_pos) * 0.1
-            delta_euler = (euler - prev_euler) * 0.1
-
-        # Clip deltas to reasonable range
-        delta_pos = np.clip(delta_pos, -0.1, 0.1)
-        delta_euler = np.clip(delta_euler, -0.5, 0.5)
-
-        # Gripper: RDT-2 outputs width, ManiSkill expects -1 (close) to 1 (open)
-        # Assume RDT-2 gripper is normalized [0, 1] or similar
-        gripper_action = np.clip(gripper * 2 - 1, -1, 1)
+        # Clip to valid range but don't scale
+        delta_pos = np.clip(pos, -1.0, 1.0)
+        delta_euler = np.clip(euler, -1.0, 1.0)
+        gripper_action = np.clip(gripper, -1.0, 1.0)
 
         maniskill_actions[t] = np.concatenate([delta_pos, delta_euler, [gripper_action]])
 
-        # Update previous state for next iteration
-        prev_pos = pos
-        prev_euler = euler
+    return maniskill_actions
+
+
+# =============================================================================
+# APPROACH 3: RDT-2 style conversion (based on original RDT2 deploy code)
+# =============================================================================
+def convert_approach_rdt2_style(
+    rdt2_action: np.ndarray,
+    current_ee_pos: np.ndarray = None,
+    current_ee_euler: np.ndarray = None,
+    pos_scale: float = 1.0,
+    rot_scale: float = 1.0
+) -> np.ndarray:
+    """
+    RDT-2 style conversion: treat RDT-2 output as relative transformation
+    and apply it to current EE pose.
+
+    Based on RDT2's get_real_umi_action() logic.
+
+    Args:
+        rdt2_action: (T, 20) or (T, 10) - RDT-2 action prediction
+        current_ee_pos: Current end-effector position (3,)
+        current_ee_euler: Current end-effector euler angles (3,)
+        pos_scale: Scale factor for position
+        rot_scale: Scale factor for rotation
+
+    Returns:
+        (T, 7) ManiSkill pd_ee_delta_pose action
+    """
+    if rdt2_action.shape[-1] == 20:
+        rdt2_action = rdt2_action[..., :10]
+
+    T = rdt2_action.shape[0]
+    maniskill_actions = np.zeros((T, 7))
+
+    for t in range(T):
+        action_pos = rdt2_action[t, :3]
+        action_rot6d = rdt2_action[t, 3:9]
+        gripper = rdt2_action[t, 9]
+
+        # Convert 6D rotation to matrix
+        action_rot_mat = rot6d_to_matrix(action_rot6d)
+
+        if current_ee_pos is not None and current_ee_euler is not None:
+            current_rot_mat = euler_to_matrix(current_ee_euler)
+
+            # RDT-2 uses relative action: target = current @ action
+            # So delta = target - current = current @ action - current
+            target_pos = current_ee_pos + action_pos  # Simplified: assume action_pos is delta
+            target_rot_mat = current_rot_mat @ action_rot_mat
+
+            delta_pos = target_pos - current_ee_pos
+            target_euler = matrix_to_euler(target_rot_mat.reshape(1, 3, 3))[0]
+            delta_euler = target_euler - current_ee_euler
+        else:
+            # Without current pose, use action directly
+            delta_pos = action_pos
+            delta_euler = matrix_to_euler(action_rot_mat.reshape(1, 3, 3))[0]
+
+        delta_pos_scaled = np.clip(delta_pos * pos_scale, -1.0, 1.0)
+        delta_euler_scaled = np.clip(delta_euler * rot_scale, -1.0, 1.0)
+        gripper_action = np.clip(gripper, -1.0, 1.0)
+
+        maniskill_actions[t] = np.concatenate([delta_pos_scaled, delta_euler_scaled, [gripper_action]])
 
     return maniskill_actions
+
+
+# =============================================================================
+# APPROACH 4: Direct use with different scales (sweep approach)
+# =============================================================================
+def convert_approach_direct(
+    rdt2_action: np.ndarray,
+    pos_scale: float = 1.0,
+    rot_scale: float = 1.0
+) -> np.ndarray:
+    """
+    Direct conversion: treat RDT-2 position output as delta, scale accordingly.
+
+    Args:
+        rdt2_action: (T, 20) or (T, 10) - RDT-2 action prediction
+        pos_scale: Scale factor for position
+        rot_scale: Scale factor for rotation
+
+    Returns:
+        (T, 7) ManiSkill pd_ee_delta_pose action
+    """
+    if rdt2_action.shape[-1] == 20:
+        rdt2_action = rdt2_action[..., :10]
+
+    T = rdt2_action.shape[0]
+    maniskill_actions = np.zeros((T, 7))
+
+    for t in range(T):
+        pos = rdt2_action[t, :3]
+        rot6d = rdt2_action[t, 3:9]
+        gripper = rdt2_action[t, 9]
+
+        euler = rot6d_to_euler(rot6d)
+
+        # Scale and clip
+        delta_pos = np.clip(pos * pos_scale, -1.0, 1.0)
+        delta_euler = np.clip(euler * rot_scale, -1.0, 1.0)
+        gripper_action = np.clip(gripper, -1.0, 1.0)
+
+        maniskill_actions[t] = np.concatenate([delta_pos, delta_euler, [gripper_action]])
+
+    return maniskill_actions
+
+
+# =============================================================================
+# Master conversion function that dispatches to appropriate approach
+# =============================================================================
+def convert_rdt2_to_maniskill_action(
+    rdt2_action: np.ndarray,
+    approach: str = "delta",
+    prev_pos: np.ndarray = None,
+    prev_euler: np.ndarray = None,
+    current_ee_pos: np.ndarray = None,
+    current_ee_euler: np.ndarray = None,
+    pos_scale: float = 1.0,
+    rot_scale: float = 1.0
+) -> np.ndarray:
+    """
+    Master conversion function that dispatches to the appropriate approach.
+
+    Args:
+        rdt2_action: (T, 20) or (T, 10) - RDT-2 action prediction
+        approach: Conversion approach ("delta", "raw", "rdt2_style", "direct")
+        prev_pos: Previous position (for delta approach)
+        prev_euler: Previous euler (for delta approach)
+        current_ee_pos: Current EE position (for rdt2_style approach)
+        current_ee_euler: Current EE euler (for rdt2_style approach)
+        pos_scale: Position scale factor
+        rot_scale: Rotation scale factor
+
+    Returns:
+        (T, 7) ManiSkill action
+    """
+    if approach == "delta":
+        return convert_approach_delta(rdt2_action, prev_pos, prev_euler, pos_scale, rot_scale)
+    elif approach == "raw":
+        return convert_approach_raw(rdt2_action)
+    elif approach == "rdt2_style":
+        return convert_approach_rdt2_style(rdt2_action, current_ee_pos, current_ee_euler, pos_scale, rot_scale)
+    elif approach == "direct":
+        return convert_approach_direct(rdt2_action, pos_scale, rot_scale)
+    else:
+        raise ValueError(f"Unknown approach: {approach}")
 
 
 # -----------------------------
@@ -276,6 +477,15 @@ def parse_args(args=None):
     # dtype
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"],
                         help="모델 추론 dtype")
+
+    # Multi-approach experiment arguments
+    parser.add_argument("--approach", type=str, default="delta",
+                        choices=["delta", "raw", "rdt2_style", "direct"],
+                        help="Action conversion approach")
+    parser.add_argument("--pos-scale", type=float, default=1.0,
+                        help="Position scale factor for delta/direct approaches")
+    parser.add_argument("--rot-scale", type=float, default=1.0,
+                        help="Rotation scale factor for delta/direct approaches")
 
     return parser.parse_args(args)
 
@@ -488,6 +698,7 @@ def main():
     # ---------- Instruction ----------
     instruction = args.instruction or TASK_INSTRUCTIONS.get(args.env_id, "Complete the task.")
     print(f"[INFO] Using instruction: {instruction}")
+    print(f"[INFO] Approach: {args.approach}, pos_scale: {args.pos_scale}, rot_scale: {args.rot_scale}")
 
     # ---------- Eval loop ----------
     MAX_EPISODE_STEPS = args.max_steps
@@ -538,10 +749,30 @@ def main():
                 actions_np = actions.detach().cpu().numpy()
                 actions_np = actions_np[::down]  # Downsample temporally
 
-                # Convert RDT-2 format to ManiSkill format
+                # Debug: Print raw RDT-2 output values (only first few steps)
+                if global_steps < 3:
+                    print(f"\n[DEBUG] Step {global_steps}, Approach: {args.approach}")
+                    print(f"  RDT-2 raw output shape: {actions_np.shape}")
+                    first_action = actions_np[0, :10]  # First arm, first timestep
+                    print(f"  pos[:3] = {first_action[:3]}")
+                    print(f"  rot6d[3:9] = {first_action[3:9]}")
+                    print(f"  gripper[9] = {first_action[9]}")
+
+                # Convert RDT-2 format to ManiSkill format using selected approach
                 maniskill_actions = convert_rdt2_to_maniskill_action(
-                    actions_np, prev_pos=prev_pos, prev_euler=prev_euler
+                    actions_np,
+                    approach=args.approach,
+                    prev_pos=prev_pos,
+                    prev_euler=prev_euler,
+                    current_ee_pos=None,  # TODO: extract from obs for rdt2_style
+                    current_ee_euler=None,
+                    pos_scale=args.pos_scale,
+                    rot_scale=args.rot_scale
                 )
+
+                # Debug: Print converted ManiSkill actions
+                if global_steps < 3:
+                    print(f"  -> ManiSkill action[0]: {maniskill_actions[0]}")
 
                 # Update prev state from last action for next iteration
                 last_action = actions_np[-1, :10] if actions_np.shape[-1] >= 10 else actions_np[-1]

@@ -16,9 +16,15 @@ usage() {
     echo "  --live-view   Show live view during evaluation"
     echo "  --output-dir  Video output directory (default: videos)"
     echo ""
+    echo "RDT-2 specific options:"
+    echo "  --approach    Action conversion approach (delta|raw|rdt2_style|direct) [default: delta]"
+    echo "  --pos-scale   Position scale factor [default: 1.0]"
+    echo "  --rot-scale   Rotation scale factor [default: 1.0]"
+    echo ""
     echo "Examples:"
     echo "  ./run.sh PickCube-v1 rdt --save-video"
-    echo "  ./run.sh PickCube-v1 rdt2 --save-video --output-dir my_videos"
+    echo "  ./run.sh PickCube-v1 rdt2 --save-video --approach delta --pos-scale 5.0"
+    echo "  ./run.sh PickCube-v1 rdt2 --approach raw --save-video"
     echo "  ./run.sh PickCube-v1 all --clean"
     exit 1
 }
@@ -36,6 +42,10 @@ CLEAN_MODELS=false
 SAVE_VIDEO=""
 LIVE_VIEW=""
 OUTPUT_DIR="videos"
+# RDT-2 specific
+APPROACH="delta"
+POS_SCALE="1.0"
+ROT_SCALE="1.0"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -53,6 +63,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --output-dir)
             OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --approach)
+            APPROACH="$2"
+            shift 2
+            ;;
+        --pos-scale)
+            POS_SCALE="$2"
+            shift 2
+            ;;
+        --rot-scale)
+            ROT_SCALE="$2"
             shift 2
             ;;
         *)
@@ -154,11 +176,15 @@ case $MODEL in
     rdt2)
         download_rdt2
         echo "[INFO] Evaluating RDT-2 on $ENV_ID..."
+        echo "[INFO] Approach: $APPROACH, pos_scale: $POS_SCALE, rot_scale: $ROT_SCALE"
         python -m src.evaluation.eval_rdt2 \
             --env-id $ENV_ID \
             --pretrained_path robotics-diffusion-transformer/RDT2-VQ \
             --vae_path robotics-diffusion-transformer/RVQActionTokenizer \
             --normalizer_path pretrained_models/rdt2/umi_normalizer_wo_downsample_indentity_rot.pt \
+            --approach "$APPROACH" \
+            --pos-scale "$POS_SCALE" \
+            --rot-scale "$ROT_SCALE" \
             $SAVE_VIDEO \
             $LIVE_VIEW \
             --output-dir "$OUTPUT_DIR"
